@@ -1,101 +1,22 @@
-from __future__ import print_function
-
 import string
-import sys
-from collections import deque
 
 import numpy as np
 from scipy.misc import logsumexp
-from sklearn.base import BaseEstimator, _pprint
+from sklearn.base import BaseEstimator
 from sklearn.utils import check_array, check_random_state
 from sklearn.utils.validation import check_is_fitted
 
 from . import _hmmc
+from .monitors import ConvergenceMonitor, RelativeMonitor, ThresholdMonitor
 from .utils import normalize, log_normalize, iter_from_X_lengths, log_mask_zero
 
 
 #: Supported decoder algorithms.
 DECODER_ALGORITHMS = frozenset(("viterbi", "map"))
 
-
-class ConvergenceMonitor(object):
-    """Monitors and reports convergence to :data:`sys.stderr`.
-
-    Parameters
-    ----------
-    tol : double
-        Convergence threshold. EM has converged either if the maximum
-        number of iterations is reached or the log probability
-        improvement between the two consecutive iterations is less
-        than threshold.
-
-    n_iter : int
-        Maximum number of iterations to perform.
-
-    verbose : bool
-        If ``True`` then per-iteration convergence reports are printed,
-        otherwise the monitor is mute.
-
-    Attributes
-    ----------
-    history : deque
-        The log probability of the data for the last two training
-        iterations. If the values are not strictly increasing, the
-        model did not converge.
-
-    iter : int
-        Number of iterations performed while training the model.
-    """
-    _template = "{iter:>10d} {logprob:>16.4f} {delta:>+16.4f}"
-
-    def __init__(self, tol, n_iter, verbose):
-        self.tol = tol
-        self.n_iter = n_iter
-        self.verbose = verbose
-        self.history = deque(maxlen=2)
-        self.iter = 0
-
-    def __repr__(self):
-        class_name = self.__class__.__name__
-        params = dict(vars(self), history=list(self.history))
-        return "{0}({1})".format(
-            class_name, _pprint(params, offset=len(class_name)))
-
-    def _reset(self):
-        """Reset the monitor's state."""
-        self.iter = 0
-        self.history.clear()
-
-    def report(self, logprob):
-        """Reports convergence to :data:`sys.stderr`.
-
-        The output consists of three columns: iteration number, log
-        probability of the data at the current iteration and convergence
-        rate.  At the first iteration convergence rate is unknown and
-        is thus denoted by NaN.
-
-        Parameters
-        ----------
-        logprob : float
-            The log probability of the data as computed by EM algorithm
-            in the current iteration.
-        """
-        if self.verbose:
-            delta = logprob - self.history[-1] if self.history else np.nan
-            message = self._template.format(
-                iter=self.iter + 1, logprob=logprob, delta=delta)
-            print(message, file=sys.stderr)
-
-        self.history.append(logprob)
-        self.iter += 1
-
-    @property
-    def converged(self):
-        """``True`` if the EM algorithm converged and ``False`` otherwise."""
-        # XXX we might want to check that ``logprob`` is non-decreasing.
-        return (self.iter == self.n_iter or
-                (len(self.history) == 2 and
-                 self.history[1] - self.history[0] < self.tol))
+MONITORS = {"absolute": ConvergenceMonitor,
+            "relative": RelativeMonitor,
+            "threshold": ThresholdMonitor}
 
 
 class _BaseHMM(BaseEstimator):
@@ -127,12 +48,23 @@ class _BaseHMM(BaseEstimator):
     random_state: RandomState or an int seed, optional
         A random number generator instance.
 
+    convergence : string, optional
+        String giving the convergence criteria to use. Must be one of
+
+        * "absolute" --- converge when the absolute gain in log
+          probability is below ``tol``.
+        * "relative" --- converge when the relative gain in log
+          probability is below ``tol``.
+        * "threshold" --- converge when the log probability is equal
+          to or greater than ``tol``.
+
+        Defaults to "absolute".
+
     n_iter : int, optional
         Maximum number of iterations to perform.
 
     tol : float, optional
-        Convergence threshold. EM will stop if the gain in log-likelihood
-        is below this value.
+        Convergence threshold. Used to determine when EM will stop.
 
     verbose : bool, optional
         When ``True`` per-iteration convergence reports are printed
@@ -166,6 +98,7 @@ class _BaseHMM(BaseEstimator):
     def __init__(self, n_components=1,
                  startprob_prior=1.0, transmat_prior=1.0,
                  algorithm="viterbi", random_state=None,
+                 convergence="absolute",
                  n_iter=10, tol=1e-2, verbose=False,
                  params=string.ascii_letters,
                  init_params=string.ascii_letters):
@@ -176,10 +109,20 @@ class _BaseHMM(BaseEstimator):
         self.transmat_prior = transmat_prior
         self.algorithm = algorithm
         self.random_state = random_state
+        self.convergence = convergence
         self.n_iter = n_iter
         self.tol = tol
         self.verbose = verbose
-        self.monitor_ = ConvergenceMonitor(self.tol, self.n_iter, self.verbose)
+
+        # XXX: Defer until `fit` to align with the rest of the class?
+        #      This also doesn't give opportunity for a custom monitor
+        #      to be set after initialization.
+        if convergence not in MONITORS:
+            raise ValueError("convergence must be one of {0}, got {1}"
+                             .format(tuple(MONITORS), convergence))
+
+        monitor = MONITORS[convergence]
+        self.monitor_ = monitor(self.tol, self.n_iter, self.verbose)
 
     def score_samples(self, X, lengths=None):
         """Compute the log probability under the model and compute posteriors.
